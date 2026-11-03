@@ -1,9 +1,12 @@
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <DNSServer.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_wifi.h> // Necesario para configurar el protocolo PHY de la antena
+#include <time.h>
 
 #ifndef SMARTFEEDER_DEBUG
 #define SMARTFEEDER_DEBUG 1
@@ -20,6 +23,12 @@ constexpr char AP_PASSWORD[] = "smartfeeder";
 constexpr byte DNS_PORT = 53;
 constexpr uint8_t AP_CHANNEL = 6; // Cambiado al canal 6 para máxima compatibilidad con teléfonos
 constexpr uint32_t WIFI_TIMEOUT_MS = 15000;
+constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
+constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000;
+constexpr char DEFAULT_BACKEND_URL[] = "http://192.168.1.65:3000";
+constexpr char DEVICE_CODE[] = "SF-ESP32-001";
+constexpr char TEST_CODE[] = "SMART-FEEDER-TEST";
+constexpr char FIRMWARE_VERSION[] = "0.1.0-debug";
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -27,9 +36,12 @@ Preferences preferences;
 
 String pendingSsid;
 String pendingPassword;
+String pendingBackendUrl;
+String feederId;
 uint32_t connectionStartedAt = 0;
 bool apActive = false;
 bool connectionInProgress = false;
+uint32_t lastTelemetryAt = 0;
 
 void debugLog(const String &message) {
 #if SMARTFEEDER_DEBUG
@@ -66,6 +78,17 @@ String jsonEscape(const String &value) {
         escaped += character;
     }
     return escaped;
+}
+
+String normalizeBackendUrl(String url) {
+    url.trim();
+    while (url.endsWith("/")) {
+        url.remove(url.length() - 1);
+    }
+    if (!url.endsWith("/api/v1")) {
+        url += "/api/v1";
+    }
+    return url;
 }
 
 String page(const String &message = "") {
@@ -113,7 +136,7 @@ String page(const String &message = "") {
     content += F(
         "<section class='card'><h2>Conecta tu dispositivo</h2>"
         "<p class='hint'>Busca tu red, selecciona una opción y escribe su contraseña.</p>"
-        "<form method='post' action='/connect'><label for='ssid'>Red Wi-Fi</label>"
+        "<form id='wifi-form' method='post' action='/connect'><label for='ssid'>Red Wi-Fi</label>"
         "<div class='row'><select id='ssid' name='ssid' required>"
         "<option value=''>Selecciona una red</option></select>"
         "<button class='secondary' type='button' onclick='scan()' id='scanButton'>Buscar</button></div>"
@@ -122,6 +145,13 @@ String page(const String &message = "") {
         "<button type='button' onclick='togglePassword()' aria-label='Mostrar contraseña'>Ver</button></div>"
         "<button type='submit'>Guardar y conectar</button></form>"
         "<div class='status'><span class='dot'></span>El punto de configuración está activo</div></section>"
+        "<section class='card'><h2>Backend</h2>"
+        "<p class='hint'>Dirección del servidor que registrará este dispositivo.</p>"
+        "<label for='backend'>URL del backend</label>"
+        "<input id='backend' name='backend' form='wifi-form' value='");
+    content += htmlEscape(pendingBackendUrl.isEmpty() ? String(DEFAULT_BACKEND_URL) : pendingBackendUrl);
+    content += F("' placeholder='http://192.168.1.50:3000'>"
+        "<p class='status'>Usa la IP de tu computadora, no localhost.</p></section>"
         "<div class='footer'>SmartFeeder · ESP32-C3</div></main>"
         "<script>"
         "const select=document.getElementById('ssid'),scanButton=document.getElementById('scanButton');"
@@ -187,6 +217,11 @@ void handleConnect() {
         server.send(400, "text/html; charset=utf-8", page("Falta el nombre de la red."));
         return;
     }
+    if (!server.hasArg("backend") || server.arg("backend").isEmpty()) {
+        server.send(400, "text/html; charset=utf-8", page("Falta la URL del backend."));
+        return;
+    }
+    pendingBackendUrl = normalizeBackendUrl(server.arg("backend"));
     beginStationConnection(server.arg("ssid"), server.arg("password"));
     server.send(200, "text/html; charset=utf-8",
                 page("Intentando conectar a " + pendingSsid + ". El dispositivo se reiniciará si tiene éxito."));
@@ -235,8 +270,110 @@ void saveCredentials() {
     }
     preferences.putString("ssid", pendingSsid);
     preferences.putString("password", pendingPassword);
+    preferences.putString("backend", normalizeBackendUrl(pendingBackendUrl));
+    if (!feederId.isEmpty()) {
+        preferences.putString("feederId", feederId);
+    }
     preferences.end();
     debugLog("Credenciales guardadas correctamente.");
+}
+
+bool registerDevice() {
+    if (pendingBackendUrl.isEmpty()) {
+        debugLog("No hay URL de backend configurada");
+        return false;
+    }
+
+    HTTPClient http;
+    const String endpoint = normalizeBackendUrl(pendingBackendUrl) + "/device/connect";
+    if (!http.begin(endpoint)) {
+        debugLog("No se pudo abrir la URL de registro: " + endpoint);
+        return false;
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.useHTTP10(true);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Connection", "close");
+    JsonDocument request;
+    request["deviceCode"] = DEVICE_CODE;
+    request["testCode"] = TEST_CODE;
+    String body;
+    serializeJson(request, body);
+
+    debugLog("Registrando dispositivo en: " + endpoint);
+    const int statusCode = http.POST(body);
+    const String response = http.getString();
+    if (statusCode < 200 || statusCode >= 300) {
+        debugLog("Registro rechazado por backend. HTTP " + String(statusCode));
+        http.end();
+        return false;
+    }
+
+    JsonDocument result;
+    const DeserializationError error = deserializeJson(result, response);
+    if (error || !result["data"]["feederId"].is<const char *>()) {
+        debugLog("Respuesta de registro invalida");
+        http.end();
+        return false;
+    }
+
+    feederId = result["data"]["feederId"].as<String>();
+    debugLog("Dispositivo registrado. feederId: " + feederId);
+    http.end();
+    return true;
+}
+
+String currentIsoTimestamp() {
+    const time_t now = time(nullptr);
+    if (now < 1700000000) {
+        return "1970-01-01T00:00:00Z";
+    }
+
+    struct tm utcTime;
+    gmtime_r(&now, &utcTime);
+    char timestamp[25];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utcTime);
+    return String(timestamp);
+}
+
+bool sendTelemetry() {
+    if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() || pendingBackendUrl.isEmpty()) {
+        debugLog("Telemetria omitida: falta Wi-Fi, feederId o backend");
+        return false;
+    }
+
+    HTTPClient http;
+    const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
+                            "/device/" + feederId + "/telemetry";
+    if (!http.begin(endpoint)) {
+        debugLog("No se pudo abrir la URL de telemetria: " + endpoint);
+        return false;
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.addHeader("Content-Type", "application/json");
+    JsonDocument request;
+    request["reportedAt"] = currentIsoTimestamp();
+    request["motorStatus"] = "ready";
+    request["sensorStatus"] = "not_calibrated";
+    request["wifiSignal"] = WiFi.RSSI();
+    request["firmwareVersion"] = FIRMWARE_VERSION;
+
+    String body;
+    serializeJson(request, body);
+    debugLog("Enviando telemetria de prueba a: " + endpoint);
+    const int statusCode = http.POST(body);
+    const String response = http.getString();
+    http.end();
+
+    if (statusCode < 200 || statusCode >= 300) {
+        debugLog("Telemetria rechazada por backend. HTTP " + String(statusCode));
+        return false;
+    }
+
+    debugLog("Telemetria enviada. HTTP " + String(statusCode) + ": " + response);
+    return true;
 }
 
 bool connectSavedNetwork() {
@@ -250,6 +387,11 @@ bool connectSavedNetwork() {
     }
     const String savedSsid = preferences.getString("ssid", "");
     const String savedPassword = preferences.getString("password", "");
+    pendingBackendUrl = preferences.getString("backend", DEFAULT_BACKEND_URL);
+    if (pendingBackendUrl.isEmpty() || pendingBackendUrl.indexOf("localhost") >= 0) {
+        pendingBackendUrl = DEFAULT_BACKEND_URL;
+    }
+    feederId = preferences.getString("feederId", "");
     preferences.end();
 
     if (savedSsid.isEmpty()) {
@@ -267,6 +409,10 @@ bool connectSavedNetwork() {
 
     if (WiFi.status() == WL_CONNECTED) {
         debugLog("Conexión exitosa a la red: " + savedSsid);
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        if (registerDevice()) {
+            saveCredentials();
+        }
         return true;
     }
 
@@ -282,6 +428,10 @@ void processConnection() {
         connectionInProgress = false;
         saveCredentials();
         debugLog("¡Conectado exitosamente a " + pendingSsid + "!");
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        if (registerDevice()) {
+            saveCredentials();
+        }
         stopAccessPoint();
         delay(1000);
         ESP.restart();
@@ -324,7 +474,12 @@ void loop() {
     server.handleClient();
     processConnection();
 
-    digitalUpdate:
+    if (WiFi.status() == WL_CONNECTED &&
+        (lastTelemetryAt == 0 || millis() - lastTelemetryAt >= TELEMETRY_INTERVAL_MS)) {
+        sendTelemetry();
+        lastTelemetryAt = millis();
+    }
+
     digitalWrite(LED_BUILTIN, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
     delay(2);
 }
