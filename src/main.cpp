@@ -24,7 +24,8 @@ constexpr byte DNS_PORT = 53;
 constexpr uint8_t AP_CHANNEL = 6; // Cambiado al canal 6 para máxima compatibilidad con teléfonos
 constexpr uint32_t WIFI_TIMEOUT_MS = 15000;
 constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000;
+constexpr uint32_t TELEMETRY_INTERVAL_MS = 240000;
+constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 60000;
 constexpr char DEFAULT_BACKEND_URL[] = "http://192.168.1.65:3000";
 constexpr char DEVICE_CODE[] = "SF-ESP32-001";
 constexpr char TEST_CODE[] = "SMART-FEEDER-TEST";
@@ -42,6 +43,7 @@ uint32_t connectionStartedAt = 0;
 bool apActive = false;
 bool connectionInProgress = false;
 uint32_t lastTelemetryAt = 0;
+uint32_t lastCommandPollAt = 0;
 
 void debugLog(const String &message) {
 #if SMARTFEEDER_DEBUG
@@ -376,6 +378,50 @@ bool sendTelemetry() {
     return true;
 }
 
+bool pollPendingCommands() {
+    if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() ||
+        pendingBackendUrl.isEmpty()) {
+        debugLog("Comandos omitidos: falta Wi-Fi, feederId o backend");
+        return false;
+    }
+
+    HTTPClient http;
+    const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
+                            "/device/" + feederId + "/commands/pending";
+    if (!http.begin(endpoint)) {
+        debugLog("No se pudo abrir la URL de comandos: " + endpoint);
+        return false;
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    const int statusCode = http.GET();
+    const String response = http.getString();
+    http.end();
+
+    if (statusCode < 200 || statusCode >= 300) {
+        debugLog("Consulta de comandos rechazada. HTTP " + String(statusCode));
+        return false;
+    }
+
+    JsonDocument result;
+    const DeserializationError error = deserializeJson(result, response);
+    if (error || !result["data"].is<JsonArray>()) {
+        debugLog("Respuesta de comandos invalida");
+        return false;
+    }
+
+    const JsonArray commands = result["data"].as<JsonArray>();
+    debugLog("Comandos pendientes recibidos: " + String(commands.size()));
+    for (JsonObject command : commands) {
+        const char *commandId = command["id"] | "";
+        const char *commandType = command["type"] | "";
+        const int requestedGrams = command["requestedGrams"] | 0;
+        debugLog("Comando " + String(commandId) + " (" + String(commandType) +
+                 ", " + String(requestedGrams) + " g) pendiente de hardware");
+    }
+    return true;
+}
+
 bool connectSavedNetwork() {
 #if SMARTFEEDER_DEBUG && SMARTFEEDER_IGNORE_SAVED_WIFI
     debugLog("Modo debug: se ignoran las credenciales Wi-Fi guardadas");
@@ -412,6 +458,8 @@ bool connectSavedNetwork() {
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         if (registerDevice()) {
             saveCredentials();
+            lastTelemetryAt = 0;
+            lastCommandPollAt = 0;
         }
         return true;
     }
@@ -431,6 +479,8 @@ void processConnection() {
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         if (registerDevice()) {
             saveCredentials();
+            lastTelemetryAt = 0;
+            lastCommandPollAt = 0;
         }
         stopAccessPoint();
         delay(1000);
@@ -474,10 +524,19 @@ void loop() {
     server.handleClient();
     processConnection();
 
-    if (WiFi.status() == WL_CONNECTED &&
-        (lastTelemetryAt == 0 || millis() - lastTelemetryAt >= TELEMETRY_INTERVAL_MS)) {
-        sendTelemetry();
-        lastTelemetryAt = millis();
+    if (WiFi.status() == WL_CONNECTED && !feederId.isEmpty()) {
+        const uint32_t now = millis();
+        if (lastTelemetryAt == 0 || now - lastTelemetryAt >= TELEMETRY_INTERVAL_MS) {
+            if (sendTelemetry()) {
+                lastTelemetryAt = now;
+            }
+        }
+        if (lastCommandPollAt == 0 ||
+            now - lastCommandPollAt >= COMMAND_POLL_INTERVAL_MS) {
+            if (pollPendingCommands()) {
+                lastCommandPollAt = now;
+            }
+        }
     }
 
     digitalWrite(LED_BUILTIN, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
