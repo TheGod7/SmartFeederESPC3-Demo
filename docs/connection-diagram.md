@@ -109,6 +109,28 @@ GPIO10. Connect the load cell according to the manufacturer's wiring for the
 specific HX711 board. Do not interchange `A+`, `A-`, `E+`, and `E-` without
 recalibrating.
 
+The firmware uses `1.0` only when no calibration has been saved. It restores
+the calibration factor and tare offset from non-volatile memory, then prints
+the raw value and calculated weight every second at 115200 baud. The servo
+remains attached after movement so the existing dispensing behavior is not
+changed.
+
+### HX711 calibration procedure
+
+1. Upload the firmware and open the serial monitor at 115200 baud.
+2. With the load cell completely empty, send `hx711 tare`.
+3. Put a known weight on the platform, for example 100 g, and wait for the
+   reading to stabilize.
+4. Send `hx711 calibrate 100` (replace `100` with the exact weight in grams).
+5. Send `hx711 read` to verify the result. The factor and tare offset are
+   stored in non-volatile memory and restored after reboot.
+
+The sign of the factor depends on the load-cell wiring. If the measured value
+is negative, keep the same sign in the calculated factor. The commands
+`hx711 status`, `hx711 raw`, `hx711 read`, and `hx711 tare` can be used at any
+time for debugging. The automatic line reports use three samples; manual
+commands use ten samples for a more stable result.
+
 ### Servo
 
 GPIO3 provides only the PWM signal. Power the servo from an external 5 V
@@ -131,6 +153,14 @@ test
 Use the angles only as calibration references. The actual dispensing and
 non-dispensing angles should be selected after checking the mechanical
 linkage, and the servo must not be forced against its end stops.
+
+When a backend `dispense` command is received, the firmware records the
+current plate weight, marks the command as `processing`, and alternates the
+servo between `0°` and `180°`. Each transition transfers the next portion
+while the other compartment refills. The HX711 is read between movements and
+the command is marked `completed` when the plate weight has increased by the
+requested grams. A 60-second timeout marks the command as `failed` if the
+requested weight is not reached.
 
 ### ESP-CAM UART
 

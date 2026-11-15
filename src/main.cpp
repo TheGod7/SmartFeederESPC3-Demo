@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DNSServer.h>
+#include <ESP32Servo.h>
+#include <HX711.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
@@ -30,10 +32,24 @@ constexpr char DEFAULT_BACKEND_URL[] = "http://192.168.1.65:3000";
 constexpr char DEVICE_CODE[] = "SF-ESP32-001";
 constexpr char TEST_CODE[] = "SMART-FEEDER-TEST";
 constexpr char FIRMWARE_VERSION[] = "0.1.0-debug";
+constexpr uint8_t SERVO_PIN = 3;
+constexpr uint32_t SERVO_TEST_STEP_MS = 2000;
+constexpr uint8_t HX711_DOUT_PIN = 7;
+constexpr uint8_t HX711_SCK_PIN = 10;
+constexpr float HX711_CALIBRATION_FACTOR = 1.0f;
+constexpr char HX711_PREFERENCES_NAMESPACE[] = "scale";
+constexpr uint32_t HX711_DEBUG_INTERVAL_MS = 1000;
+constexpr uint32_t HX711_RETRY_INTERVAL_MS = 3000;
+constexpr uint32_t DISPENSE_STEP_INTERVAL_MS = 1200;
+constexpr uint32_t DISPENSE_TIMEOUT_MS = 60000;
+constexpr uint8_t DISPENSE_SERVO_PIN_MIN = 0;
+constexpr uint8_t DISPENSE_SERVO_PIN_MAX = 180;
 
 WebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
+Servo dispenserServo;
+HX711 loadCell;
 
 String pendingSsid;
 String pendingPassword;
@@ -44,6 +60,71 @@ bool apActive = false;
 bool connectionInProgress = false;
 uint32_t lastTelemetryAt = 0;
 uint32_t lastCommandPollAt = 0;
+uint8_t servoTestStep = 0;
+uint32_t servoTestChangedAt = 0;
+bool servoTestFinished = false;
+bool hx711Ready = false;
+uint32_t lastHx711DebugAt = 0;
+uint32_t lastHx711RetryAt = 0;
+float hx711CalibrationFactor = HX711_CALIBRATION_FACTOR;
+bool hx711CalibrationSaved = false;
+bool dispenseActive = false;
+String activeCommandId;
+float dispenseTargetGrams = 0.0f;
+float dispenseBaselineGrams = 0.0f;
+uint32_t dispenseStartedAt = 0;
+uint32_t dispenseNextStepAt = 0;
+uint8_t dispenseAngle = DISPENSE_SERVO_PIN_MIN;
+uint16_t dispenseTransitions = 0;
+
+void debugLog(const String &message);
+String normalizeBackendUrl(String url);
+bool sendTelemetry();
+
+void saveHx711Calibration() {
+    if (!preferences.begin(HX711_PREFERENCES_NAMESPACE, false)) {
+        debugLog("No se pudo guardar la calibracion del HX711");
+        return;
+    }
+    preferences.putFloat("factor", hx711CalibrationFactor);
+    preferences.putLong("offset", loadCell.get_offset());
+    preferences.end();
+    debugLog("Calibracion del HX711 guardada en memoria");
+}
+
+void loadHx711Calibration() {
+    if (!preferences.begin(HX711_PREFERENCES_NAMESPACE, true)) {
+        loadCell.set_scale(hx711CalibrationFactor);
+        return;
+    }
+    hx711CalibrationSaved = preferences.isKey("factor") && preferences.isKey("offset");
+    hx711CalibrationFactor = preferences.getFloat("factor", HX711_CALIBRATION_FACTOR);
+    const long offset = preferences.getLong("offset", 0);
+    preferences.end();
+
+    if (hx711CalibrationFactor == 0.0f) {
+        hx711CalibrationFactor = HX711_CALIBRATION_FACTOR;
+    }
+    loadCell.set_scale(hx711CalibrationFactor);
+    loadCell.set_offset(offset);
+    debugLog("Calibracion HX711 cargada. Factor: " +
+             String(hx711CalibrationFactor, 3) + " | Offset: " + String(offset));
+}
+
+void resetHx711Calibration() {
+    if (!preferences.begin(HX711_PREFERENCES_NAMESPACE, false)) {
+        debugLog("No se pudo abrir la memoria para resetear el HX711");
+        return;
+    }
+    preferences.clear();
+    preferences.end();
+
+    hx711CalibrationFactor = HX711_CALIBRATION_FACTOR;
+    hx711CalibrationSaved = false;
+    loadCell.set_scale(hx711CalibrationFactor);
+    loadCell.set_offset(0);
+    debugLog("Factor y offset del HX711 eliminados. Factor actual: 1.000");
+}
 
 void debugLog(const String &message) {
 #if SMARTFEEDER_DEBUG
@@ -51,6 +132,242 @@ void debugLog(const String &message) {
 #else
     (void)message;
 #endif
+}
+
+void setServoAngle(const int angle) {
+    const int safeAngle = constrain(angle, 0, 180);
+    dispenserServo.write(safeAngle);
+    debugLog("Servo: " + String(safeAngle) + " grados");
+}
+
+bool updateCommandStatus(const String &commandId, const char *status,
+                         const char *failureReason = nullptr) {
+    if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() ||
+        pendingBackendUrl.isEmpty() || commandId.isEmpty()) {
+        debugLog("No se pudo actualizar el comando: conexión incompleta");
+        return false;
+    }
+
+    HTTPClient http;
+    const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
+                            "/device/commands/" + commandId;
+    if (!http.begin(endpoint)) {
+        debugLog("No se pudo abrir la URL de estado: " + endpoint);
+        return false;
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.useHTTP10(true);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Connection", "close");
+    JsonDocument request;
+    request["status"] = status;
+    if (failureReason != nullptr) {
+        request["failureReason"] = failureReason;
+    }
+
+    String body;
+    serializeJson(request, body);
+    const int statusCode = http.PATCH(body);
+    const String response = http.getString();
+    http.end();
+    if (statusCode < 200 || statusCode >= 300) {
+        debugLog("No se pudo actualizar el comando. HTTP " + String(statusCode) +
+                 ": " + response);
+        return false;
+    }
+    debugLog("Comando " + commandId + " actualizado a " + status);
+    return true;
+}
+
+bool startDispense(const String &commandId, const float requestedGrams) {
+    if (dispenseActive) {
+        debugLog("Dispensado rechazado: ya hay otro comando en ejecución");
+        return false;
+    }
+    if (!hx711Ready) {
+        updateCommandStatus(commandId, "failed", "HX711 no disponible");
+        return false;
+    }
+    if (requestedGrams <= 0.0f) {
+        updateCommandStatus(commandId, "failed", "Gramos solicitados inválidos");
+        return false;
+    }
+    if (!updateCommandStatus(commandId, "processing")) {
+        return false;
+    }
+
+    activeCommandId = commandId;
+    dispenseTargetGrams = requestedGrams;
+    dispenseBaselineGrams = loadCell.get_units(5);
+    dispenseStartedAt = millis();
+    dispenseNextStepAt = dispenseStartedAt + DISPENSE_STEP_INTERVAL_MS;
+    dispenseAngle = DISPENSE_SERVO_PIN_MIN;
+    dispenseTransitions = 0;
+    dispenseActive = true;
+    setServoAngle(dispenseAngle);
+    debugLog("Dispensado iniciado. Objetivo: " + String(requestedGrams, 1) +
+             " g | Base plato: " + String(dispenseBaselineGrams, 1) + " g");
+    return true;
+}
+
+void finishDispense(const bool completed, const char *failureReason = nullptr) {
+    if (!dispenseActive) return;
+
+    setServoAngle(DISPENSE_SERVO_PIN_MIN);
+    if (completed) {
+        updateCommandStatus(activeCommandId, "completed");
+        debugLog("Dispensado completado tras " + String(dispenseTransitions) +
+                 " movimientos");
+    } else {
+        updateCommandStatus(activeCommandId, "failed", failureReason);
+        debugLog("Dispensado fallido: " + String(failureReason));
+    }
+    dispenseActive = false;
+    activeCommandId = "";
+    dispenseTargetGrams = 0.0f;
+    sendTelemetry();
+}
+
+void processDispense() {
+    if (!dispenseActive || millis() < dispenseNextStepAt) return;
+
+    const float currentGrams = loadCell.get_units(3);
+    const float dispensedGrams = currentGrams - dispenseBaselineGrams;
+    debugLog("Dispensando | plato: " + String(currentGrams, 1) +
+             " g | agregado: " + String(dispensedGrams, 1) +
+             " / " + String(dispenseTargetGrams, 1) + " g");
+
+    if (dispensedGrams >= dispenseTargetGrams) {
+        finishDispense(true);
+        return;
+    }
+    if (millis() - dispenseStartedAt >= DISPENSE_TIMEOUT_MS) {
+        finishDispense(false, "Tiempo máximo de dispensado excedido");
+        return;
+    }
+
+    dispenseAngle = dispenseAngle == DISPENSE_SERVO_PIN_MIN
+                        ? DISPENSE_SERVO_PIN_MAX
+                        : DISPENSE_SERVO_PIN_MIN;
+    setServoAngle(dispenseAngle);
+    ++dispenseTransitions;
+    dispenseNextStepAt = millis() + DISPENSE_STEP_INTERVAL_MS;
+}
+
+void processSerialCommands() {
+    while (Serial.available() > 0) {
+        const String command = Serial.readStringUntil('\n');
+        String normalized = command;
+        normalized.trim();
+        normalized.toLowerCase();
+        if (normalized.length() == 0) continue;
+
+        if (normalized == "0" || normalized == "90" || normalized == "180") {
+            setServoAngle(normalized.toInt());
+            servoTestFinished = true;
+        } else if (normalized == "test") {
+            servoTestStep = 0;
+            servoTestChangedAt = millis() - SERVO_TEST_STEP_MS;
+            servoTestFinished = false;
+            debugLog("Iniciando prueba del servo: 0, 90 y 180 grados");
+        } else if (normalized == "hx711 tare") {
+            if (!hx711Ready) {
+                debugLog("HX711 TARE rechazado: HX711 no esta listo");
+            } else {
+                debugLog("Retire todo el peso. Ejecutando tara...");
+                loadCell.tare(10);
+                saveHx711Calibration();
+                debugLog("Tara completada");
+            }
+        } else if (normalized == "hx711 reset") {
+            resetHx711Calibration();
+        } else if (normalized.startsWith("hx711 calibrate ")) {
+            if (!hx711Ready) {
+                debugLog("HX711 CALIBRATE rechazado: HX711 no esta listo");
+            } else {
+                const float knownGrams = normalized.substring(16).toFloat();
+                if (knownGrams <= 0.0f) {
+                    debugLog("Uso: hx711 calibrate <gramos>, ejemplo: hx711 calibrate 100");
+                } else {
+                    const long rawWithWeight = loadCell.read_average(20);
+                    const long offset = loadCell.get_offset();
+                    const long rawDifference = rawWithWeight - offset;
+                    if (rawDifference == 0) {
+                        debugLog("Calibracion fallida: no hubo cambio de lectura. Revise la celda.");
+                    } else {
+                        hx711CalibrationFactor =
+                            static_cast<float>(rawDifference) / knownGrams;
+                        loadCell.set_scale(hx711CalibrationFactor);
+                        saveHx711Calibration();
+                        debugLog("Calibracion completada. Raw: " + String(rawWithWeight) +
+                                 " | Factor: " + String(hx711CalibrationFactor, 3));
+                        debugLog("Envie 'hx711 read' para verificar el peso.");
+                    }
+                }
+            }
+        } else if (normalized == "hx711 raw") {
+            if (!hx711Ready) {
+                debugLog("HX711 no esta listo");
+            } else {
+                debugLog("HX711 raw: " + String(loadCell.read_average(10)));
+            }
+        } else if (normalized == "hx711 read") {
+            if (!hx711Ready) {
+                debugLog("HX711 no esta listo");
+            } else {
+                debugLog("HX711 peso: " + String(loadCell.get_units(10), 3));
+            }
+        } else if (normalized == "hx711 status") {
+            debugLog("HX711 status: " + String(hx711Ready ? "LISTO" : "NO DETECTADO") +
+                     " | DT GPIO" + String(HX711_DOUT_PIN) +
+                     " | SCK GPIO" + String(HX711_SCK_PIN) +
+                     " | factor " + String(hx711CalibrationFactor, 3) +
+                     " | offset " + String(loadCell.get_offset()));
+        } else if (normalized == "hx711 help" || normalized == "help") {
+            debugLog("HX711: hx711 status | hx711 reset | hx711 tare | hx711 raw | hx711 read | hx711 calibrate <gramos>");
+        } else {
+            debugLog("Comando no reconocido: " + normalized);
+        }
+    }
+}
+
+void processServoTest() {
+    if (!dispenserServo.attached()) return;
+
+    if (servoTestFinished || millis() - servoTestChangedAt < SERVO_TEST_STEP_MS) {
+        return;
+    }
+
+    const uint8_t testAngles[] = {0, 90, 180};
+    setServoAngle(testAngles[servoTestStep]);
+    servoTestChangedAt = millis();
+    ++servoTestStep;
+    if (servoTestStep >= 3) {
+        servoTestFinished = true;
+        debugLog("Prueba terminada. Envie 0, 90, 180 o test por el monitor serie.");
+    }
+}
+
+void processHx711Debug() {
+    const uint32_t now = millis();
+    if (!hx711Ready) {
+        if (now - lastHx711RetryAt < HX711_RETRY_INTERVAL_MS) return;
+        lastHx711RetryAt = now;
+        hx711Ready = loadCell.wait_ready_timeout(250);
+        if (hx711Ready) {
+            debugLog("HX711 detectado despues de reintentar. Envie 'hx711 tare'.");
+        } else {
+            debugLog("HX711 sin respuesta en DT GPIO" + String(HX711_DOUT_PIN) +
+                     ". Revise VCC, GND, DT/DOUT y SCK.");
+        }
+        return;
+    }
+
+    if (now - lastHx711DebugAt < HX711_DEBUG_INTERVAL_MS) return;
+    lastHx711DebugAt = now;
+    debugLog("HX711 | raw: " + String(loadCell.read_average(3)) +
+             " | peso: " + String(loadCell.get_units(3), 3));
 }
 
 String htmlEscape(const String &value) {
@@ -358,9 +675,13 @@ bool sendTelemetry() {
     JsonDocument request;
     request["reportedAt"] = currentIsoTimestamp();
     request["motorStatus"] = "ready";
-    request["sensorStatus"] = "not_calibrated";
+    request["sensorStatus"] = hx711Ready ? "ready" : "error";
     request["wifiSignal"] = WiFi.RSSI();
     request["firmwareVersion"] = FIRMWARE_VERSION;
+    if (hx711Ready) {
+        request["plateFoodGrams"] =
+            max(0, static_cast<int>(lroundf(loadCell.get_units(3))));
+    }
 
     String body;
     serializeJson(request, body);
@@ -379,6 +700,7 @@ bool sendTelemetry() {
 }
 
 bool pollPendingCommands() {
+    if (dispenseActive) return true;
     if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() ||
         pendingBackendUrl.isEmpty()) {
         debugLog("Comandos omitidos: falta Wi-Fi, feederId o backend");
@@ -394,6 +716,8 @@ bool pollPendingCommands() {
     }
 
     http.setTimeout(HTTP_TIMEOUT_MS);
+    http.useHTTP10(true);
+    http.addHeader("Connection", "close");
     const int statusCode = http.GET();
     const String response = http.getString();
     http.end();
@@ -417,7 +741,10 @@ bool pollPendingCommands() {
         const char *commandType = command["type"] | "";
         const int requestedGrams = command["requestedGrams"] | 0;
         debugLog("Comando " + String(commandId) + " (" + String(commandType) +
-                 ", " + String(requestedGrams) + " g) pendiente de hardware");
+                 ", " + String(requestedGrams) + " g) recibido");
+        if (String(commandType) == "dispense") {
+            return startDispense(commandId, requestedGrams);
+        }
     }
     return true;
 }
@@ -508,6 +835,24 @@ void setupServer() {
 void setup() {
     Serial.begin(115200);
     delay(500);
+    loadCell.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
+    loadHx711Calibration();
+    hx711Ready = loadCell.wait_ready_timeout(1000);
+    if (hx711Ready) {
+        if (!hx711CalibrationSaved) {
+            loadCell.tare(10);
+            saveHx711Calibration();
+            hx711CalibrationSaved = true;
+            debugLog("HX711 listo. Tara inicial completada.");
+        } else {
+            debugLog("HX711 listo. Tara cargada desde memoria.");
+        }
+    } else {
+        debugLog("HX711 no detectado en el arranque. Revise GPIO7=DT, GPIO10=SCK, VCC y GND.");
+    }
+    dispenserServo.setPeriodHertz(50);
+    dispenserServo.attach(SERVO_PIN, 500, 2400);
+    debugLog("Prueba del servo: 0, 90 y 180 grados; pausa de 2 segundos.");
     pinMode(LED_BUILTIN, OUTPUT);
     debugLog("\n--- SmartFeeder Iniciando ---");
 
@@ -523,6 +868,10 @@ void loop() {
     }
     server.handleClient();
     processConnection();
+    processSerialCommands();
+    processServoTest();
+    processHx711Debug();
+    processDispense();
 
     if (WiFi.status() == WL_CONNECTED && !feederId.isEmpty()) {
         const uint32_t now = millis();
