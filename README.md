@@ -19,6 +19,7 @@ the servo from the ESP32-C3 3.3 V regulator.
 ## Firmware behavior
 
 - Opens `SmartFeeder-Setup` when no saved Wi-Fi network is available.
+- Access point password: `smartfeeder`.
 - Stores Wi-Fi, backend URL, feeder ID, HX711 calibration, and servo position in
   NVS.
 - Sends telemetry immediately after connecting and then once per minute.
