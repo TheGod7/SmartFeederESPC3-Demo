@@ -45,7 +45,7 @@ constexpr uint16_t HOPPER_MAX_DISTANCE_MM = 200;
 constexpr uint16_t PET_PRESENT_DISTANCE_MM = 100;
 constexpr uint32_t ULTRASONIC_INTERVAL_MS = 1000;
 constexpr uint32_t PET_ABSENCE_TIMEOUT_MS = 20000;
-constexpr uint8_t PET_DETECTION_CONFIRMATION_SAMPLES = 2;
+constexpr uint8_t PET_DETECTION_CONFIRMATION_SAMPLES = 3;
 constexpr uint8_t PET_ABSENCE_CONFIRMATION_SAMPLES = 5;
 constexpr float HX711_CALIBRATION_FACTOR = 1.0f;
 constexpr char HX711_PREFERENCES_NAMESPACE[] = "scale";
@@ -55,9 +55,11 @@ constexpr uint8_t HX711_GAIN = 128;
 constexpr uint8_t HX711_STABLE_SAMPLE_COUNT = 9;
 constexpr uint8_t HX711_TRIMMED_SAMPLE_COUNT = 5;
 constexpr float HX711_ZERO_DEADBAND_GRAMS = 0.25f;
+constexpr float HX711_MAX_STABLE_SPREAD_GRAMS = 100.0f;
 constexpr uint16_t HX711_TARE_SAMPLES = 20;
 constexpr uint32_t HX711_SETTLE_TIME_MS = 1500;
-constexpr uint32_t DISPENSE_STEP_INTERVAL_MS = 1200;
+constexpr uint32_t DISPENSE_OPEN_PULSE_MS = 350;
+constexpr uint32_t DISPENSE_SETTLE_TIME_MS = 1200;
 constexpr uint32_t DISPENSE_TIMEOUT_MS = 60000;
 constexpr float DISPENSE_TARGET_TOLERANCE_GRAMS = 1.0f;
 constexpr uint8_t DISPENSE_STABLE_CONFIRMATIONS = 2;
@@ -87,6 +89,7 @@ bool hx711Ready = false;
 uint32_t lastHx711DebugAt = 0;
 uint32_t lastHx711RetryAt = 0;
 float hx711CalibrationFactor = HX711_CALIBRATION_FACTOR;
+float lastHx711SpreadGrams = 0.0f;
 bool hx711CalibrationSaved = false;
 uint16_t hopperDistanceMm = 0;
 uint16_t petDistanceMm = 0;
@@ -112,6 +115,7 @@ uint8_t dispenseAngle = DISPENSE_SERVO_PIN_MIN;
 uint16_t dispenseTransitions = 0;
 uint8_t persistedServoAngle = DISPENSE_SERVO_PIN_MIN;
 uint8_t dispenseStableConfirmations = 0;
+bool dispenseGateOpen = false;
 
 void debugLog(const String &message);
 String normalizeBackendUrl(String url);
@@ -230,9 +234,14 @@ long readStableRaw() {
         samples[position + 1] = value;
     }
 
-    long total = 0;
     const uint8_t firstTrimmedIndex =
         (HX711_STABLE_SAMPLE_COUNT - HX711_TRIMMED_SAMPLE_COUNT) / 2;
+    lastHx711SpreadGrams =
+        fabsf(static_cast<float>(
+                  samples[firstTrimmedIndex + HX711_TRIMMED_SAMPLE_COUNT - 1] -
+                  samples[firstTrimmedIndex]) /
+              max(0.001f, fabsf(hx711CalibrationFactor)));
+    long total = 0;
     for (uint8_t index = 0; index < HX711_TRIMMED_SAMPLE_COUNT; ++index) {
         total += samples[firstTrimmedIndex + index];
     }
@@ -251,10 +260,16 @@ float readStableGrams() {
     return rawToGrams(readStableRaw());
 }
 
-float captureStablePlateGrams() {
-    if (!hx711Ready) return 0.0f;
-    lastStablePlateGrams = max(0.0f, readStableGrams());
-    return lastStablePlateGrams;
+bool captureStablePlateGrams() {
+    if (!hx711Ready) return false;
+    const long stableRaw = readStableRaw();
+    if (lastHx711SpreadGrams > HX711_MAX_STABLE_SPREAD_GRAMS) {
+        debugLog("HX711 inestable: variacion " +
+                 String(lastHx711SpreadGrams, 2) + " g; se conserva la ultima lectura.");
+        return false;
+    }
+    lastStablePlateGrams = max(0.0f, rawToGrams(stableRaw));
+    return true;
 }
 
 uint16_t readUltrasonicDistanceMm(const uint8_t echoPin) {
@@ -295,7 +310,6 @@ void processUltrasonicSensors() {
         }
         if (!petPresenceActive &&
             petDetectionSamples >= PET_DETECTION_CONFIRMATION_SAMPLES) {
-            captureStablePlateGrams();
             petPresenceActive = true;
             debugLog("Mascota detectada. Enviando evento al backend.");
             sendTelemetry("detected");
@@ -328,8 +342,11 @@ void processPendingPlateMeasurement() {
     if (!plateMeasurementPending || millis() < plateMeasurementAt) {
         return;
     }
+    if (!captureStablePlateGrams()) {
+        plateMeasurementAt = millis() + 500;
+        return;
+    }
     plateMeasurementPending = false;
-    captureStablePlateGrams();
     sendTelemetry("left", &lastStablePlateGrams);
     debugLog("Medicion posterior a la presencia enviada al backend.");
 }
@@ -450,7 +467,8 @@ bool startDispense(const String &commandId, const String &feedingEventId,
         updateCommandStatus(commandId, "failed", "Gramos solicitados inválidos");
         return false;
     }
-    const float currentPlateGrams = max(0.0f, readStableGrams());
+    captureStablePlateGrams();
+    const float currentPlateGrams = lastStablePlateGrams;
     if (currentPlateGrams >= requestedGrams) {
         const String reason = "El plato ya tiene " + String(currentPlateGrams, 1) +
                               " g; el comando solicitaba " +
@@ -476,12 +494,13 @@ bool startDispense(const String &commandId, const String &feedingEventId,
     dispenseBaselineGrams = currentPlateGrams;
     dispenseStartedAt = millis();
     dispenseStartedIso = currentIsoTimestamp();
-    dispenseNextStepAt = dispenseStartedAt + DISPENSE_STEP_INTERVAL_MS;
+    dispenseNextStepAt = dispenseStartedAt + DISPENSE_SETTLE_TIME_MS;
     dispenseAngle = persistedServoAngle;
     dispenseTransitions = 0;
     dispenseStableConfirmations = 0;
+    dispenseGateOpen = false;
     dispenseActive = true;
-    setServoAngle(dispenseAngle);
+    setServoAngle(DISPENSE_SERVO_PIN_MIN);
     debugLog("Dispensado iniciado. Objetivo total: " + String(requestedGrams, 1) +
              " g | Base plato: " + String(dispenseBaselineGrams, 1) +
              " g | Diferencia: " + String(dispenseTargetGrams, 1) + " g");
@@ -493,7 +512,8 @@ void finishDispense(const bool completed, const char *failureReason = nullptr) {
 
     setServoAngle(DISPENSE_SERVO_PIN_MIN);
     saveServoPosition(DISPENSE_SERVO_PIN_MIN);
-    const float finalGrams = max(0.0f, readStableGrams());
+    captureStablePlateGrams();
+    const float finalGrams = lastStablePlateGrams;
     const float dispensedGrams = max(0.0f, finalGrams - dispenseBaselineGrams);
     const char *resultStatus = completed ? "completed" : "failed";
     const bool reported = reportDispenseResult(resultStatus, dispensedGrams,
@@ -512,13 +532,22 @@ void finishDispense(const bool completed, const char *failureReason = nullptr) {
     activeFeedingEventId = "";
     dispenseStartedIso = "";
     dispenseTargetGrams = 0.0f;
+    dispenseGateOpen = false;
     sendTelemetry();
 }
 
 void processDispense() {
     if (!dispenseActive || millis() < dispenseNextStepAt) return;
 
-    const float currentGrams = max(0.0f, readStableGrams());
+    if (dispenseGateOpen) {
+        setServoAngle(DISPENSE_SERVO_PIN_MIN);
+        dispenseGateOpen = false;
+        dispenseNextStepAt = millis() + DISPENSE_SETTLE_TIME_MS;
+        return;
+    }
+
+    captureStablePlateGrams();
+    const float currentGrams = lastStablePlateGrams;
     const float dispensedGrams = currentGrams - dispenseBaselineGrams;
     debugLog("Dispensando | plato: " + String(currentGrams, 1) +
              " g | agregado: " + String(dispensedGrams, 1) +
@@ -540,12 +569,10 @@ void processDispense() {
         return;
     }
 
-    dispenseAngle = dispenseAngle == DISPENSE_SERVO_PIN_MIN
-                        ? DISPENSE_SERVO_PIN_MAX
-                        : DISPENSE_SERVO_PIN_MIN;
-    setServoAngle(dispenseAngle);
+    setServoAngle(DISPENSE_SERVO_PIN_MAX);
+    dispenseGateOpen = true;
     ++dispenseTransitions;
-    dispenseNextStepAt = millis() + DISPENSE_STEP_INTERVAL_MS;
+    dispenseNextStepAt = millis() + DISPENSE_OPEN_PULSE_MS;
 }
 
 void processSerialCommands() {
@@ -664,8 +691,12 @@ void processHx711Debug() {
     if (now - lastHx711DebugAt < HX711_DEBUG_INTERVAL_MS) return;
     lastHx711DebugAt = now;
     const long stableRaw = readStableRaw();
+    if (lastHx711SpreadGrams <= HX711_MAX_STABLE_SPREAD_GRAMS) {
+        lastStablePlateGrams = max(0.0f, rawToGrams(stableRaw));
+    }
     debugLog("HX711 | raw estable: " + String(stableRaw) +
-             " | peso estable: " + String(rawToGrams(stableRaw), 3));
+             " | peso estable: " + String(lastStablePlateGrams, 3) +
+             " | variacion: " + String(lastHx711SpreadGrams, 2) + " g");
 }
 
 String htmlEscape(const String &value) {
@@ -996,9 +1027,12 @@ bool sendTelemetry(const char *petEvent, const float *plateGramsOverride) {
         request["petEvent"] = petEvent;
     }
     if (hx711Ready && (!petPresenceActive || petEvent != nullptr)) {
+        if (plateGramsOverride == nullptr && petEvent == nullptr) {
+            captureStablePlateGrams();
+        }
         const float grams = plateGramsOverride != nullptr
                                 ? *plateGramsOverride
-                                : captureStablePlateGrams();
+                                : lastStablePlateGrams;
         request["plateFoodGrams"] =
             max(0, static_cast<int>(lroundf(grams)));
     }
