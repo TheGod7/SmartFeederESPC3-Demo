@@ -1,10 +1,7 @@
 # SmartFeeder Connection Diagram
 
-This document defines the planned wiring for the project's **ESP32-C3
-DevKitM-1 / ESP32-C3 Mini**. The current firmware has a servo positioning
-scaffold for testing GPIO3, but does not yet execute the backend `dispense`
-command or use the HX711 to stop at a requested weight. This pin map is the
-wiring contract for the next programming stage.
+This document defines the wiring for the project's **ESP32-C3 DevKitM-1 /
+ESP32-C3 Mini** and the sensors used by the current firmware.
 
 > **Important:** verify the silkscreen on your board before wiring. This design
 > uses GPIO numbers, which may not match the `D*` names printed on clone
@@ -102,6 +99,29 @@ the ESP32-C3. Never connect `ECHO` directly to the ESP32-C3. Keep the two
 sensor cables separated and avoid pointing both transducers directly at each
 other.
 
+The firmware identifies GPIO5 as the plate-level sensor and GPIO6 as the
+pet-presence sensor. It measures them sequentially every second and includes
+valid readings in telemetry:
+
+| Backend field | Source | Meaning |
+| --- | --- | --- |
+| `hopperDistanceMm` | GPIO5 | Distance inside the food deposit, valid up to 200 mm |
+| `hopperFoodPercent` | GPIO5 | Estimated deposit fill: `106 mm = 0%`, `0 mm = 100%`; farther readings are 0% |
+| `petDistanceMm` | GPIO6 | Distance from the presence sensor |
+| `petPresent` | GPIO6 | `true` when distance is at most 100 mm |
+
+The 100 mm presence threshold is a firmware constant and should be adjusted
+after testing the sensor's physical position.
+
+When the pet is detected in two consecutive valid readings, telemetry includes
+`petEvent: "detected"`. Invalid ultrasonic readings do not count as absence.
+After 20 seconds without a valid detection plus five confirmed absence readings,
+the firmware waits for the HX711 to settle without blocking the main loop and
+includes `petEvent: "left"`. the backend uses the HX711 plate weight before and after that session to
+calculate and persist consumption on the corresponding feeding event. It can notify the frontend with
+alerts for full, partial, or untouched food, and it skips a later dispense
+command when more than 2 g remain on the plate.
+
 ### HX711 and load cell
 
 Connect HX711 `VCC` to 3.3 V, `GND` to GND, `DT/DOUT` to GPIO7, and `SCK` to
@@ -128,8 +148,8 @@ changed.
 The sign of the factor depends on the load-cell wiring. If the measured value
 is negative, keep the same sign in the calculated factor. The commands
 `hx711 status`, `hx711 raw`, `hx711 read`, and `hx711 tare` can be used at any
-time for debugging. The automatic line reports use three samples; manual
-commands use ten samples for a more stable result.
+time for debugging. Automatic weight readings use nine samples, discard the two
+highest and two lowest values, and average the remaining five.
 
 ### Servo
 

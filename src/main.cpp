@@ -26,8 +26,9 @@ constexpr byte DNS_PORT = 53;
 constexpr uint8_t AP_CHANNEL = 6; // Cambiado al canal 6 para máxima compatibilidad con teléfonos
 constexpr uint32_t WIFI_TIMEOUT_MS = 15000;
 constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 240000;
+constexpr uint32_t TELEMETRY_INTERVAL_MS = 60000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 60000;
+constexpr wifi_power_t WIFI_TX_POWER = WIFI_POWER_8_5dBm;
 constexpr char DEFAULT_BACKEND_URL[] = "http://192.168.1.65:3000";
 constexpr char DEVICE_CODE[] = "SF-ESP32-001";
 constexpr char TEST_CODE[] = "SMART-FEEDER-TEST";
@@ -36,14 +37,33 @@ constexpr uint8_t SERVO_PIN = 3;
 constexpr uint32_t SERVO_TEST_STEP_MS = 2000;
 constexpr uint8_t HX711_DOUT_PIN = 7;
 constexpr uint8_t HX711_SCK_PIN = 10;
+constexpr uint8_t ULTRASONIC_TRIG_PIN = 4;
+constexpr uint8_t HOPPER_ECHO_PIN = 5;
+constexpr uint8_t PET_ECHO_PIN = 6;
+constexpr uint16_t HOPPER_EMPTY_DISTANCE_MM = 106;
+constexpr uint16_t HOPPER_MAX_DISTANCE_MM = 200;
+constexpr uint16_t PET_PRESENT_DISTANCE_MM = 100;
+constexpr uint32_t ULTRASONIC_INTERVAL_MS = 1000;
+constexpr uint32_t PET_ABSENCE_TIMEOUT_MS = 20000;
+constexpr uint8_t PET_DETECTION_CONFIRMATION_SAMPLES = 2;
+constexpr uint8_t PET_ABSENCE_CONFIRMATION_SAMPLES = 5;
 constexpr float HX711_CALIBRATION_FACTOR = 1.0f;
 constexpr char HX711_PREFERENCES_NAMESPACE[] = "scale";
 constexpr uint32_t HX711_DEBUG_INTERVAL_MS = 1000;
 constexpr uint32_t HX711_RETRY_INTERVAL_MS = 3000;
+constexpr uint8_t HX711_GAIN = 128;
+constexpr uint8_t HX711_STABLE_SAMPLE_COUNT = 9;
+constexpr uint8_t HX711_TRIMMED_SAMPLE_COUNT = 5;
+constexpr float HX711_ZERO_DEADBAND_GRAMS = 0.25f;
+constexpr uint16_t HX711_TARE_SAMPLES = 20;
+constexpr uint32_t HX711_SETTLE_TIME_MS = 1500;
 constexpr uint32_t DISPENSE_STEP_INTERVAL_MS = 1200;
 constexpr uint32_t DISPENSE_TIMEOUT_MS = 60000;
+constexpr float DISPENSE_TARGET_TOLERANCE_GRAMS = 1.0f;
+constexpr uint8_t DISPENSE_STABLE_CONFIRMATIONS = 2;
 constexpr uint8_t DISPENSE_SERVO_PIN_MIN = 0;
 constexpr uint8_t DISPENSE_SERVO_PIN_MAX = 180;
+constexpr char SERVO_PREFERENCES_NAMESPACE[] = "servo";
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -68,18 +88,46 @@ uint32_t lastHx711DebugAt = 0;
 uint32_t lastHx711RetryAt = 0;
 float hx711CalibrationFactor = HX711_CALIBRATION_FACTOR;
 bool hx711CalibrationSaved = false;
+uint16_t hopperDistanceMm = 0;
+uint16_t petDistanceMm = 0;
+bool hopperDistanceValid = false;
+bool petDistanceValid = false;
+uint32_t lastUltrasonicAt = 0;
+bool petPresenceActive = false;
+uint32_t lastPetSeenAt = 0;
+uint8_t petDetectionSamples = 0;
+uint8_t petAbsenceSamples = 0;
+bool plateMeasurementPending = false;
+uint32_t plateMeasurementAt = 0;
+float lastStablePlateGrams = 0.0f;
 bool dispenseActive = false;
 String activeCommandId;
+String activeFeedingEventId;
 float dispenseTargetGrams = 0.0f;
 float dispenseBaselineGrams = 0.0f;
+String dispenseStartedIso;
 uint32_t dispenseStartedAt = 0;
 uint32_t dispenseNextStepAt = 0;
 uint8_t dispenseAngle = DISPENSE_SERVO_PIN_MIN;
 uint16_t dispenseTransitions = 0;
+uint8_t persistedServoAngle = DISPENSE_SERVO_PIN_MIN;
+uint8_t dispenseStableConfirmations = 0;
 
 void debugLog(const String &message);
 String normalizeBackendUrl(String url);
-bool sendTelemetry();
+String currentIsoTimestamp();
+void processUltrasonicSensors();
+void processPendingPlateMeasurement();
+bool sendTelemetry(const char *petEvent = nullptr);
+
+void sendInitialTelemetry() {
+    lastUltrasonicAt = millis() - ULTRASONIC_INTERVAL_MS;
+    processUltrasonicSensors();
+    if (sendTelemetry()) {
+        lastTelemetryAt = millis();
+        debugLog("Telemetria inicial enviada al iniciar.");
+    }
+}
 
 void saveHx711Calibration() {
     if (!preferences.begin(HX711_PREFERENCES_NAMESPACE, false)) {
@@ -134,9 +182,163 @@ void debugLog(const String &message) {
 #endif
 }
 
+void loadServoPosition() {
+    if (!preferences.begin(SERVO_PREFERENCES_NAMESPACE, true)) {
+        return;
+    }
+    persistedServoAngle = preferences.getUChar("angle", DISPENSE_SERVO_PIN_MIN);
+    preferences.end();
+    if (persistedServoAngle > DISPENSE_SERVO_PIN_MAX) {
+        persistedServoAngle = DISPENSE_SERVO_PIN_MIN;
+    }
+    debugLog("Posicion del servo cargada: " + String(persistedServoAngle) + " grados");
+}
+
+void saveServoPosition(const uint8_t angle) {
+    if (!preferences.begin(SERVO_PREFERENCES_NAMESPACE, false)) {
+        debugLog("No se pudo guardar la posicion del servo");
+        return;
+    }
+    preferences.putUChar("angle", angle);
+    preferences.end();
+    persistedServoAngle = angle;
+}
+
+void configureWifiPower() {
+    if (!WiFi.setTxPower(WIFI_TX_POWER)) {
+        debugLog("No se pudo configurar la potencia Wi-Fi");
+        return;
+    }
+    WiFi.setSleep(true);
+    debugLog("Wi-Fi configurado a 8.5 dBm con ahorro de energia activo");
+}
+
+long readStableRaw() {
+    long samples[HX711_STABLE_SAMPLE_COUNT];
+    for (uint8_t index = 0; index < HX711_STABLE_SAMPLE_COUNT; ++index) {
+        samples[index] = loadCell.read();
+    }
+
+    for (uint8_t index = 1; index < HX711_STABLE_SAMPLE_COUNT; ++index) {
+        const long value = samples[index];
+        int8_t position = index - 1;
+        while (position >= 0 && samples[position] > value) {
+            samples[position + 1] = samples[position];
+            --position;
+        }
+        samples[position + 1] = value;
+    }
+
+    long total = 0;
+    const uint8_t firstTrimmedIndex =
+        (HX711_STABLE_SAMPLE_COUNT - HX711_TRIMMED_SAMPLE_COUNT) / 2;
+    for (uint8_t index = 0; index < HX711_TRIMMED_SAMPLE_COUNT; ++index) {
+        total += samples[firstTrimmedIndex + index];
+    }
+    return total / HX711_TRIMMED_SAMPLE_COUNT;
+}
+
+float rawToGrams(const long raw) {
+    const float grams = (raw - loadCell.get_offset()) / hx711CalibrationFactor;
+    if (fabsf(grams) < HX711_ZERO_DEADBAND_GRAMS || grams < 0.0f) {
+        return 0.0f;
+    }
+    return grams;
+}
+
+float readStableGrams() {
+    return rawToGrams(readStableRaw());
+}
+
+float captureStablePlateGrams() {
+    if (!hx711Ready) return 0.0f;
+    lastStablePlateGrams = max(0.0f, readStableGrams());
+    return lastStablePlateGrams;
+}
+
+uint16_t readUltrasonicDistanceMm(const uint8_t echoPin) {
+    digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+    const unsigned long duration = pulseIn(echoPin, HIGH, 30000);
+    if (duration == 0) return 0;
+    return static_cast<uint16_t>((duration * 10UL) / 58UL);
+}
+
+void processUltrasonicSensors() {
+    if (millis() - lastUltrasonicAt < ULTRASONIC_INTERVAL_MS) return;
+    lastUltrasonicAt = millis();
+
+    hopperDistanceMm = readUltrasonicDistanceMm(HOPPER_ECHO_PIN);
+    hopperDistanceValid = hopperDistanceMm > 0 &&
+                          hopperDistanceMm <= HOPPER_MAX_DISTANCE_MM;
+    delay(60);
+    petDistanceMm = readUltrasonicDistanceMm(PET_ECHO_PIN);
+    petDistanceValid = petDistanceMm > 0;
+
+    const uint32_t now = millis();
+    const bool petDetected = petDistanceValid &&
+                             petDistanceMm <= PET_PRESENT_DISTANCE_MM;
+    if (petDetected) {
+        if (plateMeasurementPending) {
+            plateMeasurementPending = false;
+            debugLog("Mascota regreso durante la estabilizacion; se cancela el cierre de la sesion.");
+        }
+        lastPetSeenAt = now;
+        petAbsenceSamples = 0;
+        if (petDetectionSamples < PET_DETECTION_CONFIRMATION_SAMPLES) {
+            ++petDetectionSamples;
+        }
+        if (!petPresenceActive &&
+            petDetectionSamples >= PET_DETECTION_CONFIRMATION_SAMPLES) {
+            captureStablePlateGrams();
+            petPresenceActive = true;
+            debugLog("Mascota detectada. Enviando evento al backend.");
+            sendTelemetry("detected");
+        }
+    } else if (petDistanceValid) {
+        petDetectionSamples = 0;
+        if (petPresenceActive) {
+            if (petAbsenceSamples < PET_ABSENCE_CONFIRMATION_SAMPLES) {
+                ++petAbsenceSamples;
+            }
+            if (petAbsenceSamples >= PET_ABSENCE_CONFIRMATION_SAMPLES &&
+                now - lastPetSeenAt >= PET_ABSENCE_TIMEOUT_MS &&
+                !plateMeasurementPending) {
+                petPresenceActive = false;
+                petAbsenceSamples = 0;
+                plateMeasurementPending = true;
+                plateMeasurementAt = now + HX711_SETTLE_TIME_MS;
+                debugLog("Mascota ausente durante 20 segundos. Esperando estabilizacion del plato.");
+            }
+        }
+    }
+
+    debugLog("Ultrasonicos | deposito: " +
+             (hopperDistanceValid ? String(hopperDistanceMm) + " mm" : "sin lectura") +
+             " | mascota: " +
+             (petDistanceValid ? String(petDistanceMm) + " mm" : "sin lectura"));
+}
+
+void processPendingPlateMeasurement() {
+    if (!plateMeasurementPending || millis() < plateMeasurementAt) {
+        return;
+    }
+    plateMeasurementPending = false;
+    captureStablePlateGrams();
+    sendTelemetry("left");
+    debugLog("Medicion posterior a la presencia enviada al backend.");
+}
+
 void setServoAngle(const int angle) {
     const int safeAngle = constrain(angle, 0, 180);
     dispenserServo.write(safeAngle);
+    if (!dispenseActive && safeAngle != persistedServoAngle) {
+        saveServoPosition(static_cast<uint8_t>(safeAngle));
+    }
     debugLog("Servo: " + String(safeAngle) + " grados");
 }
 
@@ -180,7 +382,61 @@ bool updateCommandStatus(const String &commandId, const char *status,
     return true;
 }
 
-bool startDispense(const String &commandId, const float requestedGrams) {
+bool reportDispenseResult(const char *status, const float dispensedGrams,
+                          const char *failureReason = nullptr) {
+    if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() ||
+        pendingBackendUrl.isEmpty() || activeCommandId.isEmpty()) {
+        debugLog("No se pudo reportar el resultado: conexión incompleta");
+        return false;
+    }
+
+    HTTPClient http;
+    const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
+                            "/device/" + feederId + "/dispense-result";
+    if (!http.begin(endpoint)) {
+        debugLog("No se pudo abrir la URL de resultado: " + endpoint);
+        return false;
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.useHTTP10(true);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Connection", "close");
+    JsonDocument request;
+    request["commandId"] = activeCommandId;
+    if (!activeFeedingEventId.isEmpty()) {
+        request["feedingEventId"] = activeFeedingEventId;
+    }
+    request["status"] = status;
+    request["startedAt"] = dispenseStartedIso;
+    request["completedAt"] = currentIsoTimestamp();
+    request["dispensedGrams"] = max(0, static_cast<int>(lroundf(dispensedGrams)));
+    if (strcmp(status, "completed") == 0) {
+        request["dispensedAt"] = currentIsoTimestamp();
+    }
+    if (failureReason != nullptr) {
+        request["failureReason"] = failureReason;
+        if (strcmp(status, "failed") == 0) {
+            request["hardwareErrorCode"] = "DISPENSE_FAILED";
+        }
+    }
+
+    String body;
+    serializeJson(request, body);
+    const int statusCode = http.POST(body);
+    const String response = http.getString();
+    http.end();
+    if (statusCode < 200 || statusCode >= 300) {
+        debugLog("No se pudo reportar el resultado. HTTP " +
+                 String(statusCode) + ": " + response);
+        return false;
+    }
+    debugLog("Resultado de dispensado reportado: " + String(status));
+    return true;
+}
+
+bool startDispense(const String &commandId, const String &feedingEventId,
+                   const float requestedGrams) {
     if (dispenseActive) {
         debugLog("Dispensado rechazado: ya hay otro comando en ejecución");
         return false;
@@ -193,21 +449,41 @@ bool startDispense(const String &commandId, const float requestedGrams) {
         updateCommandStatus(commandId, "failed", "Gramos solicitados inválidos");
         return false;
     }
+    const float currentPlateGrams = max(0.0f, readStableGrams());
+    if (currentPlateGrams >= requestedGrams) {
+        const String reason = "El plato ya tiene " + String(currentPlateGrams, 1) +
+                              " g; el comando solicitaba " +
+                              String(requestedGrams, 1) + " g.";
+        activeCommandId = commandId;
+        activeFeedingEventId = feedingEventId;
+        if (!reportDispenseResult("skipped", 0.0f, reason.c_str())) {
+            updateCommandStatus(commandId, "failed", reason.c_str());
+        }
+        activeCommandId = "";
+        activeFeedingEventId = "";
+        debugLog("Dispensado omitido: " + reason);
+        sendTelemetry();
+        return false;
+    }
     if (!updateCommandStatus(commandId, "processing")) {
         return false;
     }
 
     activeCommandId = commandId;
-    dispenseTargetGrams = requestedGrams;
-    dispenseBaselineGrams = loadCell.get_units(5);
+    activeFeedingEventId = feedingEventId;
+    dispenseTargetGrams = requestedGrams - currentPlateGrams;
+    dispenseBaselineGrams = currentPlateGrams;
     dispenseStartedAt = millis();
+    dispenseStartedIso = currentIsoTimestamp();
     dispenseNextStepAt = dispenseStartedAt + DISPENSE_STEP_INTERVAL_MS;
-    dispenseAngle = DISPENSE_SERVO_PIN_MIN;
+    dispenseAngle = persistedServoAngle;
     dispenseTransitions = 0;
+    dispenseStableConfirmations = 0;
     dispenseActive = true;
     setServoAngle(dispenseAngle);
-    debugLog("Dispensado iniciado. Objetivo: " + String(requestedGrams, 1) +
-             " g | Base plato: " + String(dispenseBaselineGrams, 1) + " g");
+    debugLog("Dispensado iniciado. Objetivo total: " + String(requestedGrams, 1) +
+             " g | Base plato: " + String(dispenseBaselineGrams, 1) +
+             " g | Diferencia: " + String(dispenseTargetGrams, 1) + " g");
     return true;
 }
 
@@ -215,16 +491,25 @@ void finishDispense(const bool completed, const char *failureReason = nullptr) {
     if (!dispenseActive) return;
 
     setServoAngle(DISPENSE_SERVO_PIN_MIN);
+    saveServoPosition(DISPENSE_SERVO_PIN_MIN);
+    const float finalGrams = max(0.0f, readStableGrams());
+    const float dispensedGrams = max(0.0f, finalGrams - dispenseBaselineGrams);
+    const char *resultStatus = completed ? "completed" : "failed";
+    const bool reported = reportDispenseResult(resultStatus, dispensedGrams,
+                                               failureReason);
+    if (!reported) {
+        updateCommandStatus(activeCommandId, resultStatus, failureReason);
+    }
     if (completed) {
-        updateCommandStatus(activeCommandId, "completed");
         debugLog("Dispensado completado tras " + String(dispenseTransitions) +
                  " movimientos");
     } else {
-        updateCommandStatus(activeCommandId, "failed", failureReason);
         debugLog("Dispensado fallido: " + String(failureReason));
     }
     dispenseActive = false;
     activeCommandId = "";
+    activeFeedingEventId = "";
+    dispenseStartedIso = "";
     dispenseTargetGrams = 0.0f;
     sendTelemetry();
 }
@@ -232,13 +517,20 @@ void finishDispense(const bool completed, const char *failureReason = nullptr) {
 void processDispense() {
     if (!dispenseActive || millis() < dispenseNextStepAt) return;
 
-    const float currentGrams = loadCell.get_units(3);
+    const float currentGrams = max(0.0f, readStableGrams());
     const float dispensedGrams = currentGrams - dispenseBaselineGrams;
     debugLog("Dispensando | plato: " + String(currentGrams, 1) +
              " g | agregado: " + String(dispensedGrams, 1) +
              " / " + String(dispenseTargetGrams, 1) + " g");
 
-    if (dispensedGrams >= dispenseTargetGrams) {
+    const float completionTarget = max(
+        0.0f, dispenseTargetGrams - DISPENSE_TARGET_TOLERANCE_GRAMS);
+    if (dispensedGrams >= completionTarget) {
+        ++dispenseStableConfirmations;
+    } else {
+        dispenseStableConfirmations = 0;
+    }
+    if (dispenseStableConfirmations >= DISPENSE_STABLE_CONFIRMATIONS) {
         finishDispense(true);
         return;
     }
@@ -276,7 +568,7 @@ void processSerialCommands() {
                 debugLog("HX711 TARE rechazado: HX711 no esta listo");
             } else {
                 debugLog("Retire todo el peso. Ejecutando tara...");
-                loadCell.tare(10);
+                loadCell.tare(HX711_TARE_SAMPLES);
                 saveHx711Calibration();
                 debugLog("Tara completada");
             }
@@ -290,7 +582,7 @@ void processSerialCommands() {
                 if (knownGrams <= 0.0f) {
                     debugLog("Uso: hx711 calibrate <gramos>, ejemplo: hx711 calibrate 100");
                 } else {
-                    const long rawWithWeight = loadCell.read_average(20);
+                    const long rawWithWeight = readStableRaw();
                     const long offset = loadCell.get_offset();
                     const long rawDifference = rawWithWeight - offset;
                     if (rawDifference == 0) {
@@ -310,13 +602,13 @@ void processSerialCommands() {
             if (!hx711Ready) {
                 debugLog("HX711 no esta listo");
             } else {
-                debugLog("HX711 raw: " + String(loadCell.read_average(10)));
+                debugLog("HX711 raw estable: " + String(readStableRaw()));
             }
         } else if (normalized == "hx711 read") {
             if (!hx711Ready) {
                 debugLog("HX711 no esta listo");
             } else {
-                debugLog("HX711 peso: " + String(loadCell.get_units(10), 3));
+                debugLog("HX711 peso estable: " + String(readStableGrams(), 3));
             }
         } else if (normalized == "hx711 status") {
             debugLog("HX711 status: " + String(hx711Ready ? "LISTO" : "NO DETECTADO") +
@@ -364,10 +656,15 @@ void processHx711Debug() {
         return;
     }
 
+    if (petPresenceActive) {
+        return;
+    }
+
     if (now - lastHx711DebugAt < HX711_DEBUG_INTERVAL_MS) return;
     lastHx711DebugAt = now;
-    debugLog("HX711 | raw: " + String(loadCell.read_average(3)) +
-             " | peso: " + String(loadCell.get_units(3), 3));
+    const long stableRaw = readStableRaw();
+    debugLog("HX711 | raw estable: " + String(stableRaw) +
+             " | peso estable: " + String(rawToGrams(stableRaw), 3));
 }
 
 String htmlEscape(const String &value) {
@@ -528,6 +825,7 @@ void beginStationConnection(const String &ssid, const String &password) {
 
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(pendingSsid.c_str(), pendingPassword.c_str());
+    configureWifiPower();
     debugLog("Intentando conectar a: " + pendingSsid);
 }
 
@@ -565,6 +863,7 @@ void startAccessPoint() {
         debugLog("Error crítico: No se pudo abrir el punto de acceso");
         return;
     }
+    configureWifiPower();
 
     delay(500);
     apActive = true;
@@ -656,7 +955,7 @@ String currentIsoTimestamp() {
     return String(timestamp);
 }
 
-bool sendTelemetry() {
+bool sendTelemetry(const char *petEvent) {
     if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() || pendingBackendUrl.isEmpty()) {
         debugLog("Telemetria omitida: falta Wi-Fi, feederId o backend");
         return false;
@@ -678,9 +977,26 @@ bool sendTelemetry() {
     request["sensorStatus"] = hx711Ready ? "ready" : "error";
     request["wifiSignal"] = WiFi.RSSI();
     request["firmwareVersion"] = FIRMWARE_VERSION;
-    if (hx711Ready) {
+    if (hopperDistanceValid) {
+        request["hopperDistanceMm"] = hopperDistanceMm;
+        request["hopperFoodPercent"] = static_cast<uint8_t>(
+            constrain((HOPPER_EMPTY_DISTANCE_MM - hopperDistanceMm) * 100 /
+                          HOPPER_EMPTY_DISTANCE_MM,
+                      0, 100));
+    }
+    if (petDistanceValid || petEvent != nullptr) {
+        request["petDistanceMm"] = petDistanceMm;
+        request["petPresent"] = petPresenceActive;
+    }
+    if (petEvent != nullptr) {
+        request["petEvent"] = petEvent;
+    }
+    if (hx711Ready && (!petPresenceActive || petEvent != nullptr)) {
+        const float grams = petEvent != nullptr
+                                ? lastStablePlateGrams
+                                : captureStablePlateGrams();
         request["plateFoodGrams"] =
-            max(0, static_cast<int>(lroundf(loadCell.get_units(3))));
+            max(0, static_cast<int>(lroundf(grams)));
     }
 
     String body;
@@ -738,12 +1054,18 @@ bool pollPendingCommands() {
     debugLog("Comandos pendientes recibidos: " + String(commands.size()));
     for (JsonObject command : commands) {
         const char *commandId = command["id"] | "";
+        const char *feedingEventId = command["feedingEventId"] | "";
         const char *commandType = command["type"] | "";
         const int requestedGrams = command["requestedGrams"] | 0;
         debugLog("Comando " + String(commandId) + " (" + String(commandType) +
                  ", " + String(requestedGrams) + " g) recibido");
         if (String(commandType) == "dispense") {
-            return startDispense(commandId, requestedGrams);
+            return startDispense(commandId, feedingEventId, requestedGrams);
+        }
+        if (String(commandType) == "telemetry_request") {
+            if (sendTelemetry()) {
+                updateCommandStatus(commandId, "completed");
+            }
         }
     }
     return true;
@@ -774,6 +1096,7 @@ bool connectSavedNetwork() {
     debugLog("Red guardada encontrada, conectando a: " + savedSsid);
     WiFi.mode(WIFI_STA);
     WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+    configureWifiPower();
 
     const uint32_t startedAt = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_TIMEOUT_MS) {
@@ -785,7 +1108,7 @@ bool connectSavedNetwork() {
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         if (registerDevice()) {
             saveCredentials();
-            lastTelemetryAt = 0;
+            sendInitialTelemetry();
             lastCommandPollAt = 0;
         }
         return true;
@@ -806,7 +1129,7 @@ void processConnection() {
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         if (registerDevice()) {
             saveCredentials();
-            lastTelemetryAt = 0;
+            sendInitialTelemetry();
             lastCommandPollAt = 0;
         }
         stopAccessPoint();
@@ -836,23 +1159,33 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     loadCell.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
+    loadCell.set_gain(HX711_GAIN);
     loadHx711Calibration();
     hx711Ready = loadCell.wait_ready_timeout(1000);
     if (hx711Ready) {
+        delay(HX711_SETTLE_TIME_MS);
         if (!hx711CalibrationSaved) {
-            loadCell.tare(10);
+            loadCell.tare(HX711_TARE_SAMPLES);
             saveHx711Calibration();
             hx711CalibrationSaved = true;
-            debugLog("HX711 listo. Tara inicial completada.");
+            debugLog("HX711 listo a ganancia 128. Tara inicial completada.");
         } else {
-            debugLog("HX711 listo. Tara cargada desde memoria.");
+            debugLog("HX711 listo a ganancia 128. Tara cargada desde memoria.");
         }
     } else {
         debugLog("HX711 no detectado en el arranque. Revise GPIO7=DT, GPIO10=SCK, VCC y GND.");
     }
+    pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+    digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+    pinMode(HOPPER_ECHO_PIN, INPUT);
+    pinMode(PET_ECHO_PIN, INPUT);
     dispenserServo.setPeriodHertz(50);
+    loadServoPosition();
     dispenserServo.attach(SERVO_PIN, 500, 2400);
-    debugLog("Prueba del servo: 0, 90 y 180 grados; pausa de 2 segundos.");
+    servoTestFinished = true;
+    dispenserServo.write(persistedServoAngle);
+    debugLog("Prueba automatica del servo desactivada. Posicion restaurada: " +
+             String(persistedServoAngle) + " grados. Envie 'test' para ejecutarla.");
     pinMode(LED_BUILTIN, OUTPUT);
     debugLog("\n--- SmartFeeder Iniciando ---");
 
@@ -871,6 +1204,8 @@ void loop() {
     processSerialCommands();
     processServoTest();
     processHx711Debug();
+    processUltrasonicSensors();
+    processPendingPlateMeasurement();
     processDispense();
 
     if (WiFi.status() == WL_CONNECTED && !feederId.isEmpty()) {
