@@ -984,6 +984,9 @@ bool sendTelemetry(const char *petEvent, const float *plateGramsOverride) {
             constrain((HOPPER_EMPTY_DISTANCE_MM - hopperDistanceMm) * 100 /
                           HOPPER_EMPTY_DISTANCE_MM,
                       0, 100));
+    } else {
+        request["hopperDistanceMm"] = nullptr;
+        request["hopperFoodPercent"] = nullptr;
     }
     if (petDistanceValid || petEvent != nullptr) {
         request["petDistanceMm"] = petDistanceMm;
