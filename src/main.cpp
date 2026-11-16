@@ -118,7 +118,8 @@ String normalizeBackendUrl(String url);
 String currentIsoTimestamp();
 void processUltrasonicSensors();
 void processPendingPlateMeasurement();
-bool sendTelemetry(const char *petEvent = nullptr);
+bool sendTelemetry(const char *petEvent = nullptr,
+                   const float *plateGramsOverride = nullptr);
 
 void sendInitialTelemetry() {
     lastUltrasonicAt = millis() - ULTRASONIC_INTERVAL_MS;
@@ -329,7 +330,7 @@ void processPendingPlateMeasurement() {
     }
     plateMeasurementPending = false;
     captureStablePlateGrams();
-    sendTelemetry("left");
+    sendTelemetry("left", &lastStablePlateGrams);
     debugLog("Medicion posterior a la presencia enviada al backend.");
 }
 
@@ -955,7 +956,7 @@ String currentIsoTimestamp() {
     return String(timestamp);
 }
 
-bool sendTelemetry(const char *petEvent) {
+bool sendTelemetry(const char *petEvent, const float *plateGramsOverride) {
     if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() || pendingBackendUrl.isEmpty()) {
         debugLog("Telemetria omitida: falta Wi-Fi, feederId o backend");
         return false;
@@ -992,8 +993,8 @@ bool sendTelemetry(const char *petEvent) {
         request["petEvent"] = petEvent;
     }
     if (hx711Ready && (!petPresenceActive || petEvent != nullptr)) {
-        const float grams = petEvent != nullptr
-                                ? lastStablePlateGrams
+        const float grams = plateGramsOverride != nullptr
+                                ? *plateGramsOverride
                                 : captureStablePlateGrams();
         request["plateFoodGrams"] =
             max(0, static_cast<int>(lroundf(grams)));
