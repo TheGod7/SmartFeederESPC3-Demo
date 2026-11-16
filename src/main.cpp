@@ -55,10 +55,10 @@ constexpr uint8_t HX711_GAIN = 128;
 constexpr uint8_t HX711_STABLE_SAMPLE_COUNT = 9;
 constexpr uint8_t HX711_TRIMMED_SAMPLE_COUNT = 5;
 constexpr float HX711_ZERO_DEADBAND_GRAMS = 0.25f;
-constexpr float HX711_MAX_STABLE_SPREAD_GRAMS = 100.0f;
+constexpr float HX711_MAX_STABLE_SPREAD_GRAMS = 2.0f;
 constexpr uint16_t HX711_TARE_SAMPLES = 20;
 constexpr uint32_t HX711_SETTLE_TIME_MS = 1500;
-constexpr uint32_t DISPENSE_OPEN_PULSE_MS = 350;
+constexpr uint32_t DISPENSE_OPEN_PULSE_MS = 200;
 constexpr uint32_t DISPENSE_SETTLE_TIME_MS = 1200;
 constexpr uint32_t DISPENSE_TIMEOUT_MS = 60000;
 constexpr float DISPENSE_TARGET_TOLERANCE_GRAMS = 1.0f;
@@ -546,17 +546,29 @@ void processDispense() {
         return;
     }
 
-    captureStablePlateGrams();
+    const bool stable = captureStablePlateGrams();
     const float currentGrams = lastStablePlateGrams;
     const float dispensedGrams = currentGrams - dispenseBaselineGrams;
     debugLog("Dispensando | plato: " + String(currentGrams, 1) +
              " g | agregado: " + String(dispensedGrams, 1) +
              " / " + String(dispenseTargetGrams, 1) + " g");
 
+    if (!stable) {
+        dispenseStableConfirmations = 0;
+        dispenseNextStepAt = millis() + DISPENSE_SETTLE_TIME_MS;
+        debugLog("Dispensado pausado: lectura inestable.");
+        return;
+    }
+
     const float completionTarget = max(
         0.0f, dispenseTargetGrams - DISPENSE_TARGET_TOLERANCE_GRAMS);
     if (dispensedGrams >= completionTarget) {
         ++dispenseStableConfirmations;
+        if (dispenseStableConfirmations < DISPENSE_STABLE_CONFIRMATIONS) {
+            dispenseNextStepAt = millis() + DISPENSE_SETTLE_TIME_MS;
+            debugLog("Objetivo alcanzado; esperando confirmacion estable sin abrir el servo.");
+            return;
+        }
     } else {
         dispenseStableConfirmations = 0;
     }
