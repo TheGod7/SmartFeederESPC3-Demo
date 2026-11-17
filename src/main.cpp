@@ -7,6 +7,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_wifi.h> // Necesario para configurar el protocolo PHY de la antena
 #include <time.h>
 
@@ -29,7 +30,7 @@ constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 60000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 60000;
 constexpr wifi_power_t WIFI_TX_POWER = WIFI_POWER_8_5dBm;
-constexpr char DEFAULT_BACKEND_URL[] = "http://192.168.1.65:3000";
+constexpr char DEFAULT_BACKEND_URL[] = "https://0k9x18vf-3000.usw3.devtunnels.ms";
 constexpr char DEVICE_CODE[] = "SF-ESP32-001";
 constexpr char TEST_CODE[] = "SMART-FEEDER-TEST";
 constexpr char FIRMWARE_VERSION[] = "0.1.0-debug";
@@ -42,9 +43,10 @@ constexpr uint8_t HOPPER_ECHO_PIN = 5;
 constexpr uint8_t PET_ECHO_PIN = 6;
 constexpr uint16_t HOPPER_EMPTY_DISTANCE_MM = 106;
 constexpr uint16_t HOPPER_MAX_DISTANCE_MM = 200;
-constexpr uint16_t PET_PRESENT_DISTANCE_MM = 100;
+constexpr uint16_t PET_DISTANCE_CHANGE_MM = 25;
+constexpr uint8_t PET_BASELINE_SAMPLES = 3;
 constexpr uint32_t ULTRASONIC_INTERVAL_MS = 1000;
-constexpr uint32_t PET_ABSENCE_TIMEOUT_MS = 20000;
+constexpr uint32_t PET_ABSENCE_TIMEOUT_MS = 60000;
 constexpr uint8_t PET_DETECTION_CONFIRMATION_SAMPLES = 3;
 constexpr uint8_t PET_ABSENCE_CONFIRMATION_SAMPLES = 5;
 constexpr float HX711_CALIBRATION_FACTOR = 1.0f;
@@ -58,8 +60,7 @@ constexpr float HX711_ZERO_DEADBAND_GRAMS = 0.25f;
 constexpr float HX711_MAX_STABLE_SPREAD_GRAMS = 2.0f;
 constexpr uint16_t HX711_TARE_SAMPLES = 20;
 constexpr uint32_t HX711_SETTLE_TIME_MS = 1500;
-constexpr uint32_t DISPENSE_OPEN_PULSE_MS = 200;
-constexpr uint32_t DISPENSE_SETTLE_TIME_MS = 1200;
+constexpr uint32_t DISPENSE_SETTLE_TIME_MS = 2500;
 constexpr uint32_t DISPENSE_TIMEOUT_MS = 60000;
 constexpr float DISPENSE_TARGET_TOLERANCE_GRAMS = 1.0f;
 constexpr uint8_t DISPENSE_STABLE_CONFIRMATIONS = 2;
@@ -95,6 +96,10 @@ uint16_t hopperDistanceMm = 0;
 uint16_t petDistanceMm = 0;
 bool hopperDistanceValid = false;
 bool petDistanceValid = false;
+bool petDistanceBaselineReady = false;
+uint32_t petDistanceBaselineTotalMm = 0;
+uint8_t petDistanceBaselineSamples = 0;
+uint16_t petDistanceBaselineMm = 0;
 uint32_t lastUltrasonicAt = 0;
 bool petPresenceActive = false;
 uint32_t lastPetSeenAt = 0;
@@ -103,6 +108,8 @@ uint8_t petAbsenceSamples = 0;
 bool plateMeasurementPending = false;
 uint32_t plateMeasurementAt = 0;
 float lastStablePlateGrams = 0.0f;
+float petSessionBaselineGrams = 0.0f;
+bool petSessionBaselineReady = false;
 bool dispenseActive = false;
 String activeCommandId;
 String activeFeedingEventId;
@@ -115,11 +122,13 @@ uint8_t dispenseAngle = DISPENSE_SERVO_PIN_MIN;
 uint16_t dispenseTransitions = 0;
 uint8_t persistedServoAngle = DISPENSE_SERVO_PIN_MIN;
 uint8_t dispenseStableConfirmations = 0;
-bool dispenseGateOpen = false;
 
 void debugLog(const String &message);
 String normalizeBackendUrl(String url);
 String currentIsoTimestamp();
+long readStableRaw();
+bool updateCommandStatus(const String &commandId, const char *status,
+                         const char *failureReason = nullptr);
 void processUltrasonicSensors();
 void processPendingPlateMeasurement();
 bool sendTelemetry(const char *petEvent = nullptr,
@@ -142,6 +151,7 @@ void saveHx711Calibration() {
     preferences.putFloat("factor", hx711CalibrationFactor);
     preferences.putLong("offset", loadCell.get_offset());
     preferences.end();
+    hx711CalibrationSaved = true;
     debugLog("Calibracion del HX711 guardada en memoria");
 }
 
@@ -177,6 +187,132 @@ void resetHx711Calibration() {
     loadCell.set_scale(hx711CalibrationFactor);
     loadCell.set_offset(0);
     debugLog("Factor y offset del HX711 eliminados. Factor actual: 1.000");
+}
+
+bool reportCalibrationResult(const String &commandId, const char *status,
+                             const char *failureReason = nullptr) {
+    if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() ||
+        pendingBackendUrl.isEmpty() || commandId.isEmpty()) {
+        debugLog("No se pudo reportar calibracion: conexión incompleta");
+        return false;
+    }
+
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
+    const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
+                            "/device/" + feederId + "/calibration-result";
+    if (!http.begin(client, endpoint)) {
+        debugLog("No se pudo abrir la URL de resultado de calibracion");
+        return false;
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.useHTTP10(true);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Connection", "close");
+    JsonDocument request;
+    request["commandId"] = commandId;
+    request["status"] = status;
+    if (strcmp(status, "completed") == 0) {
+        request["calibrationFactor"] = hx711CalibrationFactor;
+        request["tareOffset"] = loadCell.get_offset();
+    } else if (failureReason != nullptr) {
+        request["failureReason"] = failureReason;
+    }
+
+    String body;
+    serializeJson(request, body);
+    const int statusCode = http.POST(body);
+    const String response = http.getString();
+    http.end();
+    if (statusCode < 200 || statusCode >= 300) {
+        debugLog("Resultado de calibracion rechazado. HTTP " +
+                 String(statusCode) + ": " + response);
+        return false;
+    }
+    debugLog("Resultado de calibracion reportado: " + String(status));
+    return true;
+}
+
+bool processCalibrationCommand(JsonObject command) {
+    const String commandId = command["id"] | "";
+    const String commandType = command["type"] | "";
+    if (commandId.isEmpty() ||
+        (commandType != "calibration_tare" && commandType != "calibration_weight")) {
+        return false;
+    }
+
+    if (!hx711Ready) {
+        updateCommandStatus(commandId, "failed", "HX711 no disponible");
+        reportCalibrationResult(commandId, "failed", "HX711 no disponible");
+        return true;
+    }
+    if (petPresenceActive) {
+        const char *reason = "No se puede calibrar mientras la mascota esta presente";
+        updateCommandStatus(commandId, "failed", reason);
+        reportCalibrationResult(commandId, "failed", reason);
+        return true;
+    }
+    if (!updateCommandStatus(commandId, "processing")) {
+        return true;
+    }
+
+    String failureReason;
+    bool completed = false;
+    if (commandType == "calibration_tare") {
+        debugLog("Calibracion tare iniciada: retire todo el peso del plato.");
+        delay(HX711_SETTLE_TIME_MS);
+        loadCell.tare(HX711_TARE_SAMPLES);
+        saveHx711Calibration();
+        completed = true;
+        debugLog("Tare remoto completado. Offset: " + String(loadCell.get_offset()));
+    } else {
+        JsonDocument payload;
+        const String payloadText = command["payload"] | "{}";
+        const DeserializationError payloadError = deserializeJson(payload, payloadText);
+        const float knownGrams = payloadError ? 0.0f : payload["knownGrams"] | 0.0f;
+        if (knownGrams <= 0.0f) {
+            failureReason = "Peso conocido invalido";
+        } else {
+            debugLog("Calibracion con peso de " + String(knownGrams, 1) +
+                     " g iniciada. No mueva el plato.");
+            delay(HX711_SETTLE_TIME_MS);
+            const long rawWithWeight = readStableRaw();
+            if (lastHx711SpreadGrams > HX711_MAX_STABLE_SPREAD_GRAMS) {
+                failureReason = "Peso no estable";
+            } else {
+                const long rawDifference = rawWithWeight - loadCell.get_offset();
+                if (rawDifference <= 0) {
+                    failureReason = "No se detecto el peso conocido";
+                } else {
+                    hx711CalibrationFactor =
+                        static_cast<float>(rawDifference) / knownGrams;
+                    if (!isfinite(hx711CalibrationFactor) ||
+                        hx711CalibrationFactor <= 0.0f) {
+                        failureReason = "Factor de calibracion invalido";
+                    } else {
+                        loadCell.set_scale(hx711CalibrationFactor);
+                        saveHx711Calibration();
+                        completed = true;
+                        debugLog("Calibracion remota completada. Factor: " +
+                                 String(hx711CalibrationFactor, 3));
+                    }
+                }
+            }
+        }
+    }
+
+    if (completed) {
+        if (!reportCalibrationResult(commandId, "completed")) {
+            updateCommandStatus(commandId, "failed", "No se pudo reportar el resultado");
+        }
+    } else {
+        if (!reportCalibrationResult(commandId, "failed", failureReason.c_str())) {
+            updateCommandStatus(commandId, "failed", failureReason.c_str());
+        }
+    }
+    return true;
 }
 
 void debugLog(const String &message) {
@@ -296,8 +432,22 @@ void processUltrasonicSensors() {
     petDistanceValid = petDistanceMm > 0;
 
     const uint32_t now = millis();
-    const bool petDetected = petDistanceValid &&
-                             petDistanceMm <= PET_PRESENT_DISTANCE_MM;
+    if (petDistanceValid && !petDistanceBaselineReady) {
+        petDistanceBaselineTotalMm += petDistanceMm;
+        ++petDistanceBaselineSamples;
+        if (petDistanceBaselineSamples >= PET_BASELINE_SAMPLES) {
+            petDistanceBaselineMm = petDistanceBaselineTotalMm / PET_BASELINE_SAMPLES;
+            petDistanceBaselineReady = true;
+            debugLog("Sensor de mascota calibrado: espacio vacio " +
+                     String(petDistanceBaselineMm) + " mm");
+        }
+    }
+    const uint16_t petPresenceThresholdMm =
+        petDistanceBaselineReady && petDistanceBaselineMm > PET_DISTANCE_CHANGE_MM
+            ? petDistanceBaselineMm - PET_DISTANCE_CHANGE_MM
+            : 0;
+    const bool petDetected = petDistanceValid && petDistanceBaselineReady &&
+                             petDistanceMm <= petPresenceThresholdMm;
     if (petDetected) {
         if (plateMeasurementPending) {
             plateMeasurementPending = false;
@@ -310,9 +460,13 @@ void processUltrasonicSensors() {
         }
         if (!petPresenceActive &&
             petDetectionSamples >= PET_DETECTION_CONFIRMATION_SAMPLES) {
+            petSessionBaselineGrams = max(0.0f, lastStablePlateGrams);
+            petSessionBaselineReady = true;
             petPresenceActive = true;
-            debugLog("Mascota detectada. Enviando evento al backend.");
-            sendTelemetry("detected");
+            debugLog("Mascota detectada. Peso previo estable del plato: " +
+                     String(petSessionBaselineGrams, 1) +
+                     " g. Enviando evento al backend.");
+            sendTelemetry("detected", &petSessionBaselineGrams);
         }
     } else if (petDistanceValid) {
         petDetectionSamples = 0;
@@ -347,7 +501,11 @@ void processPendingPlateMeasurement() {
         return;
     }
     plateMeasurementPending = false;
+    if (petSessionBaselineReady && lastStablePlateGrams > petSessionBaselineGrams) {
+        debugLog("Lectura posterior mayor que la base de la sesion; se conserva el peso real medido.");
+    }
     sendTelemetry("left", &lastStablePlateGrams);
+    petSessionBaselineReady = false;
     debugLog("Medicion posterior a la presencia enviada al backend.");
 }
 
@@ -361,7 +519,7 @@ void setServoAngle(const int angle) {
 }
 
 bool updateCommandStatus(const String &commandId, const char *status,
-                         const char *failureReason = nullptr) {
+                         const char *failureReason) {
     if (WiFi.status() != WL_CONNECTED || feederId.isEmpty() ||
         pendingBackendUrl.isEmpty() || commandId.isEmpty()) {
         debugLog("No se pudo actualizar el comando: conexión incompleta");
@@ -369,9 +527,11 @@ bool updateCommandStatus(const String &commandId, const char *status,
     }
 
     HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
     const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
                             "/device/commands/" + commandId;
-    if (!http.begin(endpoint)) {
+    if (!http.begin(client, endpoint)) {
         debugLog("No se pudo abrir la URL de estado: " + endpoint);
         return false;
     }
@@ -409,9 +569,11 @@ bool reportDispenseResult(const char *status, const float dispensedGrams,
     }
 
     HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
     const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
                             "/device/" + feederId + "/dispense-result";
-    if (!http.begin(endpoint)) {
+    if (!http.begin(client, endpoint)) {
         debugLog("No se pudo abrir la URL de resultado: " + endpoint);
         return false;
     }
@@ -498,9 +660,8 @@ bool startDispense(const String &commandId, const String &feedingEventId,
     dispenseAngle = persistedServoAngle;
     dispenseTransitions = 0;
     dispenseStableConfirmations = 0;
-    dispenseGateOpen = false;
     dispenseActive = true;
-    setServoAngle(DISPENSE_SERVO_PIN_MIN);
+    setServoAngle(dispenseAngle);
     debugLog("Dispensado iniciado. Objetivo total: " + String(requestedGrams, 1) +
              " g | Base plato: " + String(dispenseBaselineGrams, 1) +
              " g | Diferencia: " + String(dispenseTargetGrams, 1) + " g");
@@ -510,8 +671,6 @@ bool startDispense(const String &commandId, const String &feedingEventId,
 void finishDispense(const bool completed, const char *failureReason = nullptr) {
     if (!dispenseActive) return;
 
-    setServoAngle(DISPENSE_SERVO_PIN_MIN);
-    saveServoPosition(DISPENSE_SERVO_PIN_MIN);
     captureStablePlateGrams();
     const float finalGrams = lastStablePlateGrams;
     const float dispensedGrams = max(0.0f, finalGrams - dispenseBaselineGrams);
@@ -532,19 +691,12 @@ void finishDispense(const bool completed, const char *failureReason = nullptr) {
     activeFeedingEventId = "";
     dispenseStartedIso = "";
     dispenseTargetGrams = 0.0f;
-    dispenseGateOpen = false;
+    saveServoPosition(dispenseAngle);
     sendTelemetry();
 }
 
 void processDispense() {
     if (!dispenseActive || millis() < dispenseNextStepAt) return;
-
-    if (dispenseGateOpen) {
-        setServoAngle(DISPENSE_SERVO_PIN_MIN);
-        dispenseGateOpen = false;
-        dispenseNextStepAt = millis() + DISPENSE_SETTLE_TIME_MS;
-        return;
-    }
 
     const bool stable = captureStablePlateGrams();
     const float currentGrams = lastStablePlateGrams;
@@ -581,10 +733,14 @@ void processDispense() {
         return;
     }
 
-    setServoAngle(DISPENSE_SERVO_PIN_MAX);
-    dispenseGateOpen = true;
+    dispenseAngle = dispenseAngle == DISPENSE_SERVO_PIN_MIN
+                        ? DISPENSE_SERVO_PIN_MAX
+                        : DISPENSE_SERVO_PIN_MIN;
+    setServoAngle(dispenseAngle);
     ++dispenseTransitions;
-    dispenseNextStepAt = millis() + DISPENSE_OPEN_PULSE_MS;
+    dispenseNextStepAt = millis() + DISPENSE_SETTLE_TIME_MS;
+    debugLog("Movimiento de dispensado #" + String(dispenseTransitions) +
+             ": " + String(dispenseAngle) + " grados");
 }
 
 void processSerialCommands() {
@@ -810,7 +966,7 @@ String page(const String &message = "") {
         "<label for='backend'>URL del backend</label>"
         "<input id='backend' name='backend' form='wifi-form' value='");
     content += htmlEscape(pendingBackendUrl.isEmpty() ? String(DEFAULT_BACKEND_URL) : pendingBackendUrl);
-    content += F("' placeholder='http://192.168.1.50:3000'>"
+    content += F("' placeholder='https://0k9x18vf-3000.usw3.devtunnels.ms'>"
         "<p class='status'>Usa la IP de tu computadora, no localhost.</p></section>"
         "<div class='footer'>SmartFeeder · ESP32-C3</div></main>"
         "<script>"
@@ -947,8 +1103,10 @@ bool registerDevice() {
     }
 
     HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
     const String endpoint = normalizeBackendUrl(pendingBackendUrl) + "/device/connect";
-    if (!http.begin(endpoint)) {
+    if (!http.begin(client, endpoint)) {
         debugLog("No se pudo abrir la URL de registro: " + endpoint);
         return false;
     }
@@ -1006,9 +1164,11 @@ bool sendTelemetry(const char *petEvent, const float *plateGramsOverride) {
     }
 
     HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
     const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
                             "/device/" + feederId + "/telemetry";
-    if (!http.begin(endpoint)) {
+    if (!http.begin(client, endpoint)) {
         debugLog("No se pudo abrir la URL de telemetria: " + endpoint);
         return false;
     }
@@ -1074,9 +1234,11 @@ bool pollPendingCommands() {
     }
 
     HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
     const String endpoint = normalizeBackendUrl(pendingBackendUrl) +
                             "/device/" + feederId + "/commands/pending";
-    if (!http.begin(endpoint)) {
+    if (!http.begin(client, endpoint)) {
         debugLog("No se pudo abrir la URL de comandos: " + endpoint);
         return false;
     }
@@ -1115,7 +1277,13 @@ bool pollPendingCommands() {
         if (String(commandType) == "telemetry_request") {
             if (sendTelemetry()) {
                 updateCommandStatus(commandId, "completed");
+            } else {
+                debugLog("Solicitud de telemetria no completada; se reintentara.");
             }
+        }
+        if (String(commandType) == "calibration_tare" ||
+            String(commandType) == "calibration_weight") {
+            processCalibrationCommand(command);
         }
     }
     return true;
@@ -1133,6 +1301,11 @@ bool connectSavedNetwork() {
     const String savedSsid = preferences.getString("ssid", "");
     const String savedPassword = preferences.getString("password", "");
     pendingBackendUrl = preferences.getString("backend", DEFAULT_BACKEND_URL);
+    if (pendingBackendUrl.indexOf("192.168.1.65") >= 0 ||
+        pendingBackendUrl.indexOf("192.168.1.91") >= 0) {
+        pendingBackendUrl = DEFAULT_BACKEND_URL;
+        debugLog("URL del backend actualizada a ngrok HTTPS");
+    }
     if (pendingBackendUrl.isEmpty() || pendingBackendUrl.indexOf("localhost") >= 0) {
         pendingBackendUrl = DEFAULT_BACKEND_URL;
     }

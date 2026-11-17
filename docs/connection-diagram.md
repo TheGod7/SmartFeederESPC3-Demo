@@ -108,9 +108,9 @@ valid readings in telemetry:
 | `hopperDistanceMm` | GPIO5 | Distance inside the food deposit, valid up to 200 mm |
 | `hopperFoodPercent` | GPIO5 | Estimated deposit fill: `106 mm = 0%`, `0 mm = 100%`; farther readings are 0% |
 | `petDistanceMm` | GPIO6 | Distance from the presence sensor |
-| `petPresent` | GPIO6 | `true` when distance is at most 100 mm |
+| `petPresent` | GPIO6 | `true` when distance is at most 500 mm |
 
-The 100 mm presence threshold is a firmware constant and should be adjusted
+The 500 mm presence threshold is a firmware constant and should be adjusted
 after testing the sensor's physical position.
 
 When the pet is detected in two consecutive valid readings, telemetry includes
